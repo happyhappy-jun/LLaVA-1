@@ -69,11 +69,17 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(default=None,
-                           metadata={"help": "Path to the training data."})
+                           metadata={"help": "Path to the training data. Can be a single JSON file or comma-separated list of JSON files."})
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    validate_images: bool = field(default=True,
+                                  metadata={"help": "Whether to validate that all images exist before training."})
+    skip_missing_images: bool = field(default=False,
+                                      metadata={"help": "If True, skip samples with missing images instead of raising an error."})
+    sanity_check: bool = field(default=False,
+                               metadata={"help": "If True, only use first 1000 training examples for quick validation of model saving."})
 
 
 @dataclass
@@ -662,12 +668,88 @@ class LazySupervisedDataset(Dataset):
                  tokenizer: transformers.PreTrainedTokenizer,
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
-
+        
+        # Handle multiple JSON files separated by commas
+        list_data_dict = []
+        data_paths = data_path.split(',') if ',' in data_path else [data_path]
+        
+        for path in data_paths:
+            path = path.strip()  # Remove any whitespace
+            rank0_print(f"Loading data from {path}")
+            with open(path, "r") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    list_data_dict.extend(data)
+                else:
+                    list_data_dict.append(data)
+        
+        rank0_print(f"Total number of samples: {len(list_data_dict)}")
+        
+        # Apply sanity check filtering if enabled
+        if data_args.sanity_check:
+            original_size = len(list_data_dict)
+            list_data_dict = list_data_dict[:1000]
+            rank0_print(f"SANITY CHECK MODE: Limiting training data from {original_size} to {len(list_data_dict)} samples")
+        
+        # Store data_args first so it's available for validation
+        self.data_args = data_args
+        
+        # Validate all images exist before training
+        if data_args.image_folder and getattr(data_args, 'validate_images', True):
+            validated_data = self._validate_images(list_data_dict, data_args.image_folder)
+            if validated_data is not None:
+                list_data_dict = validated_data
+        
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
-        self.data_args = data_args
+    
+    def _validate_images(self, data_list, image_folder):
+        """Validate that all images referenced in the dataset exist."""
+        rank0_print("Validating all images exist...")
+        missing_images = []
+        checked_images = set()
+        
+        for idx, sample in enumerate(data_list):
+            if 'image' in sample:
+                image_file = sample['image']
+                if image_file not in checked_images:
+                    checked_images.add(image_file)
+                    image_path = os.path.join(image_folder, image_file)
+                    if not os.path.exists(image_path):
+                        missing_images.append((idx, image_file))
+        
+        if missing_images:
+            rank0_print(f"ERROR: Found {len(missing_images)} missing images:")
+            for idx, img_file in missing_images[:10]:  # Show first 10 missing
+                rank0_print(f"  Sample {idx}: {img_file}")
+            if len(missing_images) > 10:
+                rank0_print(f"  ... and {len(missing_images) - 10} more")
+            
+            if getattr(self.data_args, 'skip_missing_images', False):
+                rank0_print("WARNING: Continuing with missing images (skip_missing_images=True)")
+                # Filter out samples with missing images
+                valid_data = []
+                missing_set = set()
+                for idx, img_file in missing_images:
+                    missing_set.add(img_file)
+                
+                for sample in data_list:
+                    if 'image' not in sample or sample['image'] not in missing_set:
+                        valid_data.append(sample)
+                
+                rank0_print(f"Filtered dataset: {len(data_list)} -> {len(valid_data)} samples")
+                return valid_data
+            else:
+                raise FileNotFoundError(
+                    f"Found {len(missing_images)} missing images. "
+                    "Set skip_missing_images=True to continue without them, "
+                    "or fix the missing images."
+                )
+        else:
+            rank0_print(f"✓ All {len(checked_images)} unique images validated successfully")
+        
+        return None  # Return None when no filtering needed
 
     def __len__(self):
         return len(self.list_data_dict)

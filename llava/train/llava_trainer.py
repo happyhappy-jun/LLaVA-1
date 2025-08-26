@@ -249,6 +249,21 @@ class LLaVATrainer(Trainer):
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # Fix generation config to avoid validation errors
+        if hasattr(self.model, 'generation_config'):
+            generation_config = self.model.generation_config
+            # If do_sample is False but sampling params exist, enable do_sample
+            if hasattr(generation_config, 'do_sample') and not generation_config.do_sample:
+                # Check if any sampling parameters are set (even if None)
+                has_sampling_params = any(
+                    hasattr(generation_config, param) 
+                    for param in ['temperature', 'top_p', 'top_k', 'typical_p', 'epsilon_cutoff', 'eta_cutoff']
+                )
+                
+                if has_sampling_params:
+                    # Simply enable do_sample to avoid validation errors
+                    generation_config.do_sample = True
+        
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
         else:
